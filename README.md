@@ -105,8 +105,6 @@ APPIMAGE_EXTRACT_AND_RUN=1 ./NAPS2-8.2.1-x86_64.AppImage
 
 The easiest and most modern way to manage this AppImage is using **[Gear Lever](https://github.com)** (available as a Flatpak on Flathub). It provides full desktop integration, automatic icon generation, and application menu mapping without altering your core system files. It is highly recommended for atomic/immutable distributions like Bazzite and Aurora.
 
-Alternatively, you can use traditional managers like [AppImageLauncher](https://github.com/TheAssassin/AppImageLauncher) or [appimaged](https://github.com/probonopd/go-appimage).
-
 ---
 
 ## First-Run Extraction Cache

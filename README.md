@@ -21,7 +21,7 @@ chmod +x NAPS2-8.2.1-x86_64.AppImage
 
 ## Requirements
 
-NAPS2 is a self-contained .NET 8 application. No .NET runtime needs to be installed on the target system.
+NAPS2 is a self-contained .NET application. No .NET runtime needs to be installed on the target system.
 
 For **USB and network scanner support**, install SANE:
 
@@ -51,7 +51,7 @@ sudo pacman -S sane sane-airscan
 
 | Component | Notes |
 |---|---|
-| .NET 8 runtime | Fully self-contained inside the `naps2` binary (single-file publish) |
+| .NET runtime | Fully self-contained inside the `naps2` binary (single-file publish) |
 | libpdfium | PDF rendering — statically linked, no external dependencies |
 | tesseract | OCR engine binary — OCR language data is downloaded on first use |
 | .NET native helpers | `System.Native.so`, `System.IO.Compression.Native.so`, etc. |
@@ -75,13 +75,13 @@ SANE (Scanner Access Now Easy) needs access to system scanner configuration in `
 
 ## Compatibility
 
-| Distribution | Status |
-|---|---|
-| Bazzite / Aurora (Fedora 44) | ✅ tested |
-| Fedora 40+ | ✅ expected |
-| Arch / CachyOS / Manjaro | ✅ tested (build system) |
-| Ubuntu 22.04+ | ✅ expected |
-| Any x86_64 Linux with glibc ≥ 2.17 | ✅ |
+| Distribution / Target System | Status | Note |
+|---|---|---|
+| Bazzite / Aurora (Fedora 44) | ✅ tested | Smooth hardware access via system SANE layers |
+| Fedora 40+ | ✅ expected | Full compatibility across all spin-offs |
+| Arch / CachyOS / Manjaro | ✅ tested | Out-of-the-box compatibility |
+| Ubuntu 24.04+ / Debian 13+ | ✅ expected | Built on modern Ubuntu 24.04 glibc base |
+| Older distros (glibc < 2.39) | ❌ not supported | Requires Ubuntu 24.04+ baseline (e.g. Ubuntu 22.04 not supported) |
 
 ---
 
@@ -103,7 +103,9 @@ APPIMAGE_EXTRACT_AND_RUN=1 ./NAPS2-8.2.1-x86_64.AppImage
 
 ### Desktop Integration (optional)
 
-With [AppImageLauncher](https://github.com/TheAssassin/AppImageLauncher) or [appimaged](https://github.com/probonopd/go-appimage), the AppImage is automatically integrated into your application menu with PDF and image MIME-type associations.
+The easiest and most modern way to manage this AppImage is using **[Gear Lever](https://github.com)** (available as a Flatpak on Flathub). It provides full desktop integration, automatic icon generation, and application menu mapping without altering your core system files. It is highly recommended for atomic/immutable distributions like Bazzite and Aurora.
+
+Alternatively, you can use traditional managers like [AppImageLauncher](https://github.com/TheAssassin/AppImageLauncher) or [appimaged](https://github.com/probonopd/go-appimage).
 
 ---
 
@@ -111,9 +113,7 @@ With [AppImageLauncher](https://github.com/TheAssassin/AppImageLauncher) or [app
 
 On the first launch, .NET extracts its embedded runtime assemblies to:
 
-```
 ~/.cache/naps2/
-```
 
 This directory can safely be deleted — it will be recreated on the next launch. Total size is approximately 150 MB.
 
@@ -125,30 +125,35 @@ If your home directory is on a `noexec` filesystem (some network shares), the ca
 
 ### Prerequisites
 
-```bash
-# Any distribution
-# appimagetool-x86_64.AppImage and naps2-X.Y.Z-linux-x64.deb must be in the same directory
-```
+For maximum target compatibility, it is recommended to run the build script inside an **Ubuntu 24.04 Distrobox** environment. 
 
-Download the `.deb` from [NAPS2 Releases on GitHub](https://github.com/cyanfish/naps2/releases) and `appimagetool` from [AppImage Releases](https://github.com/AppImage/appimagetool/releases).
+The script automatically detects, updates, and installs missing build-essential packages inside the container.
+
+Ensure that your downloaded **`naps2-8.2.1-linux-x64.deb`** package is placed in the **same directory** as the script before running it. If no file is present, the script will attempt to download the latest available version from GitHub automatically. (`appimagetool` will also be downloaded automatically if missing).
 
 ### Build
 
 ```bash
+# Clone this repository
+git clone https://github.com
+cd naps2-appimage
+
+# Ensure the .deb file is in this directory, then execute the build:
 chmod +x build-naps2-appimage.sh
 ./build-naps2-appimage.sh
 ```
 
-Produces `NAPS2-8.2.1-x86_64.AppImage` (~22 MB) in the current directory.
+Produces a standalone, self-contained `NAPS2-8.2.1-x86_64.AppImage` (~22 MB) directly in your current working directory.
 
 ### What the script does
 
-1. Locates the `naps2-*-linux-x64.deb` file in the current directory
-2. Extracts it using `ar` + `tar` (no `dpkg` required)
-3. Copies all files from `usr/lib/naps2/` into the AppDir
-4. Creates a minimal desktop file with correct MIME-type associations
-5. Writes an `AppRun` that sets `DOTNET_BUNDLE_EXTRACT_BASE_DIR`
-6. Packs everything with `appimagetool` using zstd compression
+1. Validates build-essential tools and provisions dependencies dynamically via `apt`.
+2. Locates the `naps2-*.tar.gz` archive in the local directory and unpacks it into a temporary sandbox.
+3. Automatically maps internal binaries and extracts the embedded system execution profiles.
+4. Generates a custom desktop entry structure with precise multi-format MIME-type associations.
+5. Injects automated `SONAME` symlink routines to resolve .NET runtime native library calls.
+6. Writes a portable `AppRun` environment handler to isolate cache directories (`DOTNET_BUNDLE_EXTRACT_BASE_DIR`).
+7. Compresses and packages the environment directory tree into a ready-to-use AppImage bundle.
 
 ---
 

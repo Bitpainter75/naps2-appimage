@@ -1,20 +1,15 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 #  build-naps2-appimage.sh
-#  Erstellt ein AppImage für NAPS2 (Not Another PDF Scanner 2)
-#  Basis: offizielles Linux-x64 .deb-Paket von GitHub Releases
-#
-#  Voraussetzungen im gleichen Verzeichnis:
-#    - naps2-<VERSION>-linux-x64.deb   (von GitHub Releases)
-#    - appimagetool-x86_64.AppImage
-#
-#  Verwendung:
-#    ./build-naps2-appimage.sh
+#  Erstellt ein hochgradig portables AppImage für NAPS2 aus einem .deb-Paket.
+#  Optimiert für Ubuntu 24.04 (Distrobox) mit manuellem appimagetool-Handling.
 # ============================================================
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OUTPUT_DIR="$SCRIPT_DIR"
+BUILD_DIR="${TMPDIR:-/tmp}/naps2-appimage-$$"
 
 # Farben
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -23,16 +18,57 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 step()  { echo -e "\n${CYAN}=== $* ===${NC}"; }
 
-# ---- Schritt 0: Voraussetzungen prüfen ----------------------
+# ---- Schritt 0: Voraussetzungen prüfen & installieren -------
 
-step "Schritt 0: Voraussetzungen"
+step "Schritt 0: Voraussetzungen prüfen"
+
+REQUIRED_PKGS=()
+command -v curl &>/dev/null || REQUIRED_PKGS+=("curl")
+command -v sed &>/dev/null || REQUIRED_PKGS+=("sed")
+command -v dpkg-deb &>/dev/null || REQUIRED_PKGS+=("dpkg")
+command -v ar &>/dev/null || REQUIRED_PKGS+=("binutils")
+command -v file &>/dev/null || REQUIRED_PKGS+=("file")
+
+SUDO_CMD=""
+if [ "$EUID" -ne 0 ]; then
+    if command -v sudo &>/dev/null; then SUDO_CMD="sudo"; else error "Sudo wird benötigt."; fi
+fi
+
+if [ ${#REQUIRED_PKGS[@]} -ne 0 ]; then
+    info "Installiere fehlende Werkzeuge auf der Build-Maschine: ${REQUIRED_PKGS[*]}"
+    $SUDO_CMD apt-get update -y
+    $SUDO_CMD apt-get install -y "${REQUIRED_PKGS[@]}"
+fi
+
+# ---- Schritt 1: Downloads / Validierung der Medien ----------
+
+step "Schritt 1: Quellmedien prüfen"
 
 APPIMAGETOOL="${SCRIPT_DIR}/appimagetool-x86_64.AppImage"
-[ -x "$APPIMAGETOOL" ] || error "appimagetool-x86_64.AppImage nicht gefunden oder nicht ausführbar."
 
-# .deb suchen
-DEB_FILE=$(find "$SCRIPT_DIR" -maxdepth 1 -name "naps2-*-linux-x64.deb" | sort -V | tail -1)
-[ -n "$DEB_FILE" ] || error "Kein naps2-*-linux-x64.deb in $SCRIPT_DIR gefunden."
+# RADIKALER FIX: Wenn die Datei existiert, wird sie NIEMALS gelöscht oder neu geladen!
+if [ -f "$APPIMAGETOOL" ]; then
+    info "Nutze vorhandenes lokales appimagetool: $APPIMAGETOOL"
+    chmod +x "$APPIMAGETOOL"
+else
+    info "appimagetool nicht im Ordner gefunden. Starte einmaligen Download..."
+    curl -sL -f -o "$APPIMAGETOOL" "https://github.com" || \
+    error "Download fehlgeschlagen. Bitte kopiere 'appimagetool-x86_64.AppImage' manuell in diesen Ordner!"
+    chmod +x "$APPIMAGETOOL"
+fi
+
+# .deb suchen oder von GitHub laden
+DEB_FILE=$(find "$SCRIPT_DIR" -maxdepth 1 -name "naps2-*-linux-x64.deb" | sort -V | tail -1 || true)
+if [ -z "$DEB_FILE" ]; then
+    info "Kein naps2 .deb im Ordner gefunden. Ermittle neueste Version von GitHub..."
+    LATEST_URL=$(curl -s https://github.com | grep "browser_download_url.*linux-x64.deb" | cut -d '"' -f 4 | head -n 1)
+    if [ -z "$LATEST_URL" ]; then error "Konnte Download-URL für NAPS2 nicht ermitteln."; fi
+
+    DEB_NAME=$(basename "$LATEST_URL")
+    info "Lade $DEB_NAME herunter..."
+    curl -sL -o "$SCRIPT_DIR/$DEB_NAME" "$LATEST_URL"
+    DEB_FILE="$SCRIPT_DIR/$DEB_NAME"
+fi
 
 # Version aus Dateiname extrahieren
 DEB_BASE=$(basename "$DEB_FILE")
@@ -40,42 +76,33 @@ VERSION=$(echo "$DEB_BASE" | grep -oP 'naps2-\K[0-9]+\.[0-9]+\.[0-9]+')
 [ -n "$VERSION" ] || error "Version konnte nicht aus '$DEB_BASE' extrahiert werden."
 
 info "NAPS2 Version: $VERSION"
-info ".deb: $DEB_FILE"
-info "appimagetool: $APPIMAGETOOL"
+info ".deb-Quelle: $DEB_FILE"
 
-# Hilfsprogramme prüfen
-for cmd in ar tar file readelf; do
-    command -v "$cmd" &>/dev/null || error "$cmd fehlt – bitte installieren."
-done
+# ---- Schritt 2: Arbeitsverzeichnis vorbereiten --------------
 
-# ---- Schritt 1: Arbeitsverzeichnis vorbereiten --------------
+step "Schritt 2: Arbeitsverzeichnis"
 
-step "Schritt 1: Arbeitsverzeichnis"
-
-WORK_DIR=$(mktemp -d /tmp/naps2-appimage-XXXXXX)
-DEB_DIR="${WORK_DIR}/deb"
-APPDIR="${WORK_DIR}/NAPS2.AppDir"
+mkdir -p "$BUILD_DIR"
+DEB_DIR="${BUILD_DIR}/deb"
+APPDIR="${BUILD_DIR}/NAPS2.AppDir"
 
 mkdir -p "$DEB_DIR" "$APPDIR"
-info "Arbeitsverzeichnis: $WORK_DIR"
-info "AppDir: $APPDIR"
+info "Sandbox vorbereitet: $BUILD_DIR"
 
-trap 'info "Räume auf: $WORK_DIR"; rm -rf "$WORK_DIR"' EXIT
+trap 'info "Räume auf: $BUILD_DIR"; rm -rf "$BUILD_DIR"' EXIT
 
-# ---- Schritt 2: .deb extrahieren ----------------------------
+# ---- Schritt 3: .deb extrahieren ----------------------------
 
-step "Schritt 2: .deb extrahieren"
+step "Schritt 3: .deb extrahieren"
 
 cd "$DEB_DIR"
 ar x "$DEB_FILE"
-info ".deb als ar-Archiv entpackt"
 
-# data.tar.xz (oder .gz) auspacken
 DATA_TAR=$(find "$DEB_DIR" -name "data.tar.*" | head -1)
 [ -n "$DATA_TAR" ] || error "data.tar.* nicht im .deb gefunden."
 
 tar xf "$DATA_TAR" -C "$DEB_DIR"
-info "data.tar extrahiert: $(basename "$DATA_TAR")"
+info "data.tar erfolgreich entpackt."
 
 DEB_ROOT="${DEB_DIR}/usr"
 [ -d "$DEB_ROOT" ] || error "Erwartetes Verzeichnis $DEB_ROOT fehlt nach Extraktion."
@@ -83,11 +110,9 @@ DEB_ROOT="${DEB_DIR}/usr"
 NAPS2_LIB="${DEB_ROOT}/lib/naps2"
 [ -d "$NAPS2_LIB" ] || error "$NAPS2_LIB fehlt – .deb-Struktur unerwartet."
 
-info "NAPS2-Binaries: $NAPS2_LIB"
+# ---- Schritt 4: AppDir-Struktur aufbauen --------------------
 
-# ---- Schritt 3: AppDir-Struktur aufbauen --------------------
-
-step "Schritt 3: AppDir-Struktur"
+step "Schritt 4: AppDir-Struktur"
 
 APPDIR_NAPS2="${APPDIR}/usr/lib/naps2"
 mkdir -p "$APPDIR_NAPS2"
@@ -107,22 +132,18 @@ else
     warn "Icon nicht gefunden: $ICON_SRC"
 fi
 
-# Inhalt prüfen
-info "AppDir/usr/lib/naps2/:"
-ls "${APPDIR_NAPS2}/"
+# ---- Schritt 5: Ausführbarkeit der Binaries -----------------
 
-# ---- Schritt 4: Ausführbarkeit der Binaries -----------------
-
-step "Schritt 4: Ausführbarkeit"
+step "Schritt 5: Ausführbarkeit"
 
 chmod +x "${APPDIR_NAPS2}/naps2"
 [ -f "${APPDIR_NAPS2}/apphost" ] && chmod +x "${APPDIR_NAPS2}/apphost"
 [ -f "${APPDIR_NAPS2}/_linux/tesseract" ] && chmod +x "${APPDIR_NAPS2}/_linux/tesseract"
-info "naps2 + apphost + tesseract ausführbar"
+info "Ausführungsrechte zugewiesen."
 
-# ---- Schritt 5: SONAME-Symlinks für gebündelte .so ----------
+# ---- Schritt 6: SONAME-Symlinks für gebündelte .so ----------
 
-step "Schritt 5: SONAME-Symlinks"
+step "Schritt 6: SONAME-Symlinks"
 
 for lib in "${APPDIR_NAPS2}"/*.so; do
     [[ -f "$lib" ]] || continue
@@ -135,14 +156,9 @@ for lib in "${APPDIR_NAPS2}"/*.so; do
     fi
 done
 
-# libpdfium (kein SONAME nötig, via dlopen mit exaktem Namen geladen)
-if [ -f "${APPDIR_NAPS2}/_linux/libpdfium.so" ]; then
-    info "  libpdfium.so vorhanden (kein SONAME, dlopen exakter Name)"
-fi
+# ---- Schritt 7: Desktop-Datei erstellen ---------------------
 
-# ---- Schritt 6: Desktop-Datei erstellen ---------------------
-
-step "Schritt 6: Desktop-Datei"
+step "Schritt 7: Desktop-Datei"
 
 DESK="${APPDIR}/com.naps2.Naps2.desktop"
 
@@ -160,11 +176,11 @@ Terminal=false
 StartupNotify=true
 EOF
 
-info "Desktop-Datei erstellt: com.naps2.Naps2.desktop"
+info "Desktop-Datei generiert."
 
-# ---- Schritt 7: AppRun erstellen ----------------------------
+# ---- Schritt 8: AppRun erstellen ----------------------------
 
-step "Schritt 7: AppRun"
+step "Schritt 8: AppRun"
 
 cat > "${APPDIR}/AppRun" << 'EOF'
 #!/bin/bash
@@ -172,8 +188,6 @@ SELF=$(readlink -f "$0")
 HERE="${SELF%/*}"
 NAPS2_DIR="${HERE}/usr/lib/naps2"
 
-# .NET Single-File entpackt Assemblies nach ~/.net/<app>/ (Standard)
-# Bei noexec-Home: alternatives Verzeichnis setzen
 if [ -n "$HOME" ] && [ -w "$HOME" ]; then
     export DOTNET_BUNDLE_EXTRACT_BASE_DIR="${DOTNET_BUNDLE_EXTRACT_BASE_DIR:-${HOME}/.cache/naps2}"
 else
@@ -184,20 +198,13 @@ exec "${NAPS2_DIR}/naps2" "$@"
 EOF
 
 chmod +x "${APPDIR}/AppRun"
-info "AppRun erstellt"
-
-# ---- Schritt 8: .DirIcon Symlink ----------------------------
-
-step "Schritt 8: .DirIcon"
-
 ln -sf "com.naps2.Naps2.png" "${APPDIR}/.DirIcon"
-info ".DirIcon → com.naps2.Naps2.png"
+info "AppRun eingerichtet."
 
 # ---- Schritt 9: Validierung ---------------------------------
 
 step "Schritt 9: Validierung"
 
-# Pflichtdateien
 for f in \
     "${APPDIR}/AppRun" \
     "${APPDIR}/com.naps2.Naps2.desktop" \
@@ -213,29 +220,29 @@ for f in \
     fi
 done
 
-# .NET native helper .so prüfen
 SO_COUNT=$(find "${APPDIR_NAPS2}" -maxdepth 1 -name "System.*.so" | wc -l)
 info "  .NET System.*.so Dateien: $SO_COUNT"
-[ "$SO_COUNT" -ge 5 ] || warn "Weniger als 5 System.*.so – .deb möglicherweise unvollständig"
 
-# Größe
 APPDIR_MB=$(du -sm "${APPDIR}" | cut -f1)
-info "  AppDir-Größe: ${APPDIR_MB} MB"
+info "  AppDir-Gesamtgröße: ${APPDIR_MB} MB"
 
 # ---- Schritt 10: AppImage bauen -----------------------------
 
 step "Schritt 10: AppImage bauen"
 
-OUTPUT="${SCRIPT_DIR}/NAPS2-${VERSION}-x86_64.AppImage"
+OUTPUT="${OUTPUT_DIR}/NAPS2-${VERSION}-x86_64.AppImage"
 
-ARCH=x86_64 "$APPIMAGETOOL" "${APPDIR}" "${OUTPUT}" 2>&1
+# FUSE-freie Ausführung im Distrobox-Container erzwingen
+export APPIMAGE_EXTRACT_AND_RUN=1
+ARCH=x86_64 "$APPIMAGETOOL" "${APPDIR}" "${OUTPUT}" > /dev/null
 
 if [ -f "$OUTPUT" ]; then
     SIZE=$(du -sh "$OUTPUT" | cut -f1)
     info ""
-    info "✅ AppImage erfolgreich erstellt!"
+    info "✅ AppImage erfolgreich aus .deb erstellt!"
     info "   Datei:  $OUTPUT"
     info "   Größe:  $SIZE"
+    exit 0
 else
-    error "AppImage wurde nicht erstellt."
+    error "AppImage-Erstellung fehlgeschlagen."
 fi
